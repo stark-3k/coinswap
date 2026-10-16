@@ -607,6 +607,16 @@ impl Wallet {
         Ok(bond_value)
     }
 
+    /// Outpoints of spendable coins that are still unconfirmed.
+    pub fn unconfirmed_spendable_outpoints(&self) -> Vec<OutPoint> {
+        self.list_descriptor_utxo_spend_info()
+            .into_iter()
+            .chain(self.list_swept_incoming_swap_utxos())
+            .filter(|(utxo, _)| utxo.confirmations == 0)
+            .map(|(utxo, _)| OutPoint::new(utxo.txid, utxo.vout))
+            .collect()
+    }
+
     /// Create a new fidelity bond with given amount and absolute height based locktime.
     /// This function creates the fidelity transaction, signs and broadcast it.
     /// Upon confirmation it stores the fidelity information in the wallet data.
@@ -622,12 +632,14 @@ impl Wallet {
     ) -> Result<(u32, Txid), WalletError> {
         let (index, fidelity_addr, fidelity_pubkey) = self.get_next_fidelity_address(locktime)?;
 
+        // The bond is rebroadcast unchanged until it confirms, so it must not
+        // spend coins that can still be replaced (e.g. a fee-bumped deposit).
         let coins = self.coin_select(
             amount,
             feerate,
             infer_address_type(&fidelity_addr.script_pubkey()),
             None,
-            None,
+            Some(self.unconfirmed_spendable_outpoints()),
         )?;
         let outputs = vec![(fidelity_addr, amount)];
 

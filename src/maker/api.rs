@@ -1403,6 +1403,21 @@ impl MakerServer {
                         } = e
                         {
                             log::warn!("Insufficient funds to create fidelity bond.");
+                            let has_unconfirmed = !lock_debug!(self.wallet.read())
+                                .map_err(|_| MakerError::General("Failed to lock wallet"))?
+                                .unconfirmed_spendable_outpoints()
+                                .is_empty();
+                            if has_unconfirmed {
+                                // A second deposit is not needed; the bond only spends confirmed coins.
+                                log::info!(
+                                    "Waiting for unconfirmed deposits to confirm before creating the fidelity bond"
+                                );
+                                log::info!("Next sync in {} secs", SYNC_INTERVAL.as_secs());
+                                if !self.wait_for_shutdown(SYNC_INTERVAL) {
+                                    return Err(MakerError::General("Shutdown requested"));
+                                }
+                                continue;
+                            }
                             // Bond change must also fund the first swap and stay at our minimum
                             // swap size, or the liquidity check right after keeps us off the market.
                             let (op_return_len, swap_feerate) = {

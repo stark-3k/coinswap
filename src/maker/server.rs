@@ -154,16 +154,25 @@ enum HeartbeatAction {
     Throttle,
 }
 
+/// A heartbeat socket is bound to the first swap id it presents, so one
+/// persistent socket cannot keep refreshing many unfunded admissions.
 fn admit_heartbeat(
+    swap_id: &str,
     known_swap: bool,
+    bound_swap_id: &mut Option<String>,
     last_keepalive: &mut Option<Instant>,
     permit: &mut ConnectionPermit,
 ) -> HeartbeatAction {
-    if !known_swap {
+    if !known_swap
+        || bound_swap_id
+            .as_deref()
+            .is_some_and(|bound| bound != swap_id)
+    {
         HeartbeatAction::Reject
     } else if last_keepalive.is_some_and(|last| last.elapsed() < MIN_KEEPALIVE_INTERVAL) {
         HeartbeatAction::Throttle
     } else {
+        bound_swap_id.get_or_insert_with(|| swap_id.to_string());
         *last_keepalive = Some(Instant::now());
         permit.mark_established();
         HeartbeatAction::Accept
@@ -634,6 +643,7 @@ fn handle_connection(
     let mut state = ConnectionState::default();
     let mut pending_deadline = Instant::now() + PENDING_CONNECTION_TIMEOUT;
     let mut last_keepalive = None;
+    let mut heartbeat_swap_id = None;
 
     log::debug!(
         "[{}] Starting connection handler",
@@ -679,7 +689,13 @@ fn handle_connection(
         // lightweight local state. Recognize them without changing the protocol.
         if let TakerToMakerMessage::WaitingFundingConfirmation(id) = &message {
             let known_swap = maker.get_connection_state(id)?.is_some();
-            match admit_heartbeat(known_swap, &mut last_keepalive, &mut permit) {
+            match admit_heartbeat(
+                id,
+                known_swap,
+                &mut heartbeat_swap_id,
+                &mut last_keepalive,
+                &mut permit,
+            ) {
                 HeartbeatAction::Reject | HeartbeatAction::Throttle => break,
                 HeartbeatAction::Accept => {}
             }
@@ -2301,22 +2317,45 @@ mod tests {
         let limiter = ConnectionLimiter::new();
         let mut permit = limiter.try_acquire().unwrap();
         let mut last_keepalive = None;
+        let mut bound = None;
 
         assert!(matches!(
-            admit_heartbeat(false, &mut last_keepalive, &mut permit),
+            admit_heartbeat("a", false, &mut bound, &mut last_keepalive, &mut permit),
             HeartbeatAction::Reject
         ));
         assert!(permit.pending);
 
         assert!(matches!(
-            admit_heartbeat(true, &mut last_keepalive, &mut permit),
+            admit_heartbeat("a", true, &mut bound, &mut last_keepalive, &mut permit),
             HeartbeatAction::Accept
         ));
         assert!(!permit.pending);
         assert!(matches!(
-            admit_heartbeat(true, &mut last_keepalive, &mut permit),
+            admit_heartbeat("a", true, &mut bound, &mut last_keepalive, &mut permit),
             HeartbeatAction::Throttle
         ));
+    }
+
+    #[test]
+    fn heartbeat_socket_is_bound_to_first_swap_id() {
+        let limiter = ConnectionLimiter::new();
+        let mut permit = limiter.try_acquire().unwrap();
+        let mut last_keepalive = None;
+        let mut bound = None;
+
+        assert!(matches!(
+            admit_heartbeat("a", true, &mut bound, &mut last_keepalive, &mut permit),
+            HeartbeatAction::Accept
+        ));
+        // Switching to another known swap id is rejected and leaves the
+        // keepalive clock untouched.
+        last_keepalive = None;
+        assert!(matches!(
+            admit_heartbeat("b", true, &mut bound, &mut last_keepalive, &mut permit),
+            HeartbeatAction::Reject
+        ));
+        assert!(last_keepalive.is_none());
+        assert_eq!(bound.as_deref(), Some("a"));
     }
 
     #[test]

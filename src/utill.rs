@@ -909,7 +909,7 @@ pub fn prompt_password(message: String) -> io::Result<Zeroizing<String>> {
     print!("{message}");
     stdout.flush()?; // Ensure the prompt is printed
 
-    let _guard = RawModeGuard::new()?;
+    let guard = RawModeGuard::new()?;
 
     let mut password = Zeroizing::new(Vec::with_capacity(256));
     let mut buf = Zeroizing::new([0u8; 1]);
@@ -918,6 +918,19 @@ pub fn prompt_password(message: String) -> io::Result<Zeroizing<String>> {
         let c = buf[0] as char;
 
         match c {
+            '\x03' | '\x04' if c == '\x03' || password.is_empty() => {
+                // - Raw mode turns off signal generation, so Ctrl-C arrives as 0x03 (and Ctrl-D
+                //   as 0x04). Treat both (Ctrl-D only on an empty prompt) as a cancel: wipe the
+                //   buffer, restore the terminal and exit like an interrupted process (130)
+                //   before any caller writes anything.
+                password.zeroize();
+                drop(guard);
+                println!();
+                std::process::exit(130);
+            }
+            '\x04' => {
+                // - Ctrl-D on a non-empty prompt is ignored.
+            }
             '\n' | '\r' => {
                 // - If the byte is newline (`\n`, ASCII 0x0A) or carriage return (`\r`, ASCII 0x0D),
                 //   it signals the end of input, so we break the loop.
@@ -960,6 +973,7 @@ pub fn prompt_password(message: String) -> io::Result<Zeroizing<String>> {
         }
     }
 
+    drop(guard);
     println!(); // move to next line after input
     let len = std::str::from_utf8(&password)
         .expect("typed characters are UTF-8")

@@ -661,6 +661,8 @@ impl Wallet {
 
     /// Creates a missing wallet for the CLI and saves its first tip. The seed
     /// phrase is sealed in the file; only a notice to back it up is logged.
+    /// An existing wallet is only opened to check the password, so a wrong
+    /// one is an error here instead of surfacing on the next start.
     pub fn init_interactive(
         path: &Path,
         backend: &BackendConfig,
@@ -668,7 +670,23 @@ impl Wallet {
     ) -> Result<(), WalletError> {
         let mut password = password.map(Zeroizing::new);
         if path.exists() {
-            return Ok(());
+            let password = password.filter(|p| !p.is_empty());
+            return match WalletStore::read_from_disk(
+                path,
+                password.map(|mut p| std::mem::take(&mut *p)),
+            ) {
+                Ok(_) => Ok(()),
+                Err(WalletError::Security(SecurityError::PasswordRequired)) => {
+                    Err(WalletError::General(format!(
+                        "wallet file {path:?} is encrypted; \
+                         provide the wallet passphrase via --password-file or -p"
+                    )))
+                }
+                Err(WalletError::Security(SecurityError::Decryption)) => Err(WalletError::General(
+                    format!("wrong password for the existing wallet file {path:?}"),
+                )),
+                Err(e) => Err(e),
+            };
         }
         // `Wallet::init` refuses old Core before a wallet file and seed are written.
         let mut wallet = Self::load_or_init(
@@ -4870,6 +4888,45 @@ mod coin_select_cap_tests {
             "the cap itself must reach coin selection, not the guard: {:?}",
             err
         );
+    }
+}
+
+#[cfg(test)]
+mod init_interactive_tests {
+    use super::*;
+    use crate::{
+        security::KeyMaterial,
+        wallet::blockchain::{BackendConfig, CoreRpcConfig},
+    };
+    use bitcoind::tempfile::tempdir;
+
+    /// An existing wallet is opened to check the password: a wrong or missing
+    /// one is an error, the right one succeeds without touching the backend.
+    #[test]
+    fn existing_wallet_checks_the_password() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("w");
+        let material = KeyMaterial::new_from_password(Some("right".to_string())).unwrap();
+        let master_key = Xpriv::new_master(Network::Regtest, &[7u8; 16]).unwrap();
+        WalletStore::init(
+            "w".to_string(),
+            &path,
+            Network::Regtest,
+            master_key,
+            None,
+            None,
+            &material,
+        )
+        .unwrap();
+        let backend = BackendConfig::CoreRpc(CoreRpcConfig::default());
+
+        Wallet::init_interactive(&path, &backend, Some("right".to_string())).unwrap();
+        let err = Wallet::init_interactive(&path, &backend, Some("wrong".to_string()))
+            .expect_err("wrong password must fail");
+        assert!(err.to_string().contains("wrong password"), "{}", err);
+        let err = Wallet::init_interactive(&path, &backend, None)
+            .expect_err("missing password must fail");
+        assert!(err.to_string().contains("passphrase"), "{}", err);
     }
 }
 

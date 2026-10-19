@@ -1429,7 +1429,7 @@ fn watchdog_finish_swap_in(
     // this an `InPaid` swap whose payment failed would be polled forever.
     let funded_at = match swap.funding_height {
         Some(height) => height,
-        None => match recover_swap_in_funding_height(maker, swap_id, swap)? {
+        None => match recover_funding_height(maker, swap_id, swap, LnMakerPhase::InPaid)? {
             Some(height) => height,
             None => return Ok(()),
         },
@@ -1503,31 +1503,33 @@ fn swap_in_htlc_refunded(maker: &Arc<MakerServer>, swap: &LnMakerSwap) -> Result
     maker.is_htlc_spend_confirmed(&outpoint, &spk)
 }
 
-/// Recovers the funding height of an InPaid swap-in stored without one, as a
-/// handler whose height lookup failed used to store it. The watchdog cannot
-/// time the taker's refund window without it. Returns the height once it is
+/// Recovers the funding height of a swap stored without one in phase
+/// `expected` (an InPaid swap-in or an OutFunded swap-out), as a handler whose
+/// height lookup failed stores it. The watchdog cannot time the refund window
+/// without it. Returns the height once it is
 /// stored; `None` leaves the swap for a later pass, because the funding has
 /// no confirmation height yet or the swap has changed since `swap` was read.
 /// A failed lookup is an error, and the swap is kept.
-fn recover_swap_in_funding_height(
+fn recover_funding_height(
     maker: &Arc<MakerServer>,
     swap_id: &str,
     swap: &LnMakerSwap,
+    expected: LnMakerPhase,
 ) -> Result<Option<u32>, MakerError> {
     let Some((outpoint, _)) = swap.funding else {
         return Ok(None);
     };
     let Some(height) = maker.tx_confirmation_height(&outpoint.txid)? else {
         log::warn!(
-            "Swap-in {swap_id}: funding {outpoint} has no confirmation height; keeping the swap \
+            "Swap {swap_id}: funding {outpoint} has no confirmation height; keeping the swap \
              until it does"
         );
         return Ok(None);
     };
-    if !maker.fill_ln_funding_height(swap_id, LnMakerPhase::InPaid, outpoint, height)? {
+    if !maker.fill_ln_funding_height(swap_id, expected, outpoint, height)? {
         return Ok(None);
     }
-    log::info!("Swap-in {swap_id}: recovered funding height {height} from the chain");
+    log::info!("Swap {swap_id}: recovered funding height {height} from the chain");
     Ok(Some(height))
 }
 
@@ -1627,11 +1629,19 @@ fn watchdog_resolve_swap_out(
             // Unspent: refund once the CSV window has passed. An early
             // attempt fails non-BIP68-final harmlessly and is retried.
             let current = maker.get_current_height()?;
-            let refundable = swap
-                .funding_height
-                .map(|h| current >= h.saturating_add(swap.locktime as u32))
-                .unwrap_or(false);
-            if !refundable {
+            // A swap stored without a height (the read before the broadcast
+            // failed) takes it from the funding's confirmation; until that
+            // exists there is nothing to time the window from.
+            let funded_at = match swap.funding_height {
+                Some(height) => height,
+                None => {
+                    match recover_funding_height(maker, swap_id, swap, LnMakerPhase::OutFunded)? {
+                        Some(height) => height,
+                        None => return Ok(()),
+                    }
+                }
+            };
+            if current < funded_at.saturating_add(swap.locktime as u32) {
                 return Ok(());
             }
             let mut swap = swap.clone();

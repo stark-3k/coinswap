@@ -358,9 +358,19 @@ fn lightning_maker_restart_refunds_unclaimed_swap_out(
         "the maker's wallet must hold the refund output"
     );
 
+    // ---- A shallow refund keeps the swap ----
+    // One confirmation can still be reorged out for the taker's claim, and
+    // only this record holds the refund key.
+    backdate_past_watchdog_idle(&maker, &swap_id);
+    std::thread::sleep(Duration::from_secs(10));
+    assert!(
+        maker.ln_swaps.lock().unwrap().contains_key(&swap_id),
+        "a refund with one confirmation must not close the swap"
+    );
+
     // ---- A later tick closes the swap ----
-    // Broadcasting touched the record, so backdate it again for the tick
-    // that sees the confirmed refund.
+    // Bury the refund, and backdate the record again for the tick that sees it.
+    generate_blocks(bitcoind, 6);
     backdate_past_watchdog_idle(&maker, &swap_id);
     wait_until!(
         Duration::from_secs(120),

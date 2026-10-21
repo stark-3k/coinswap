@@ -85,6 +85,13 @@ const REFUND_GRACE_BLOCKS: u32 = 12;
 /// Covers spotting the preimage on-chain and getting the settlement through.
 const SETTLE_MARGIN: u32 = 6;
 
+/// Confirmations our own swap-out refund needs before the maker fails the
+/// held payment and deletes the swap record. The record holds the only copy
+/// of the refund key, and a reorg that replaces the refund with the taker's
+/// hashlock claim must still find it, with the payment still held so the
+/// revealed preimage can settle it.
+const REFUND_FINALITY_DEPTH: u32 = 6;
+
 /// Blocks allowed for the maker's own HTLC funding to confirm.
 ///
 /// The refund branch is CSV, so it opens `locktime` blocks after the funding
@@ -1113,9 +1120,12 @@ fn handle_swap_out_paid<M: Maker>(
     // Worst case: our funding takes the whole confirmation budget, so the
     // CSV clock starts that late and the taker can claim until then plus
     // the locktime.
+    // The held payment is only failed once our refund is `REFUND_FINALITY_DEPTH`
+    // deep, and a reorg inside that depth can still hand the taker the claim.
     let claim_window_ends = tip
         .saturating_add(FUNDING_CONF_BUDGET)
-        .saturating_add(swap.locktime as u32);
+        .saturating_add(swap.locktime as u32)
+        .saturating_add(REFUND_FINALITY_DEPTH);
     match claim_deadline {
         Some(deadline) if deadline >= claim_window_ends.saturating_add(SETTLE_MARGIN) => {}
         Some(deadline) => {
@@ -1124,7 +1134,8 @@ fn handle_swap_out_paid<M: Maker>(
                 format!(
                     "lightning claim deadline {deadline} is before the on-chain claim \
                      window closes at {claim_window_ends} (tip {tip} + {FUNDING_CONF_BUDGET} \
-                     confirmation budget + {} locktime + {SETTLE_MARGIN} margin); the node's \
+                     confirmation budget + {} locktime + {REFUND_FINALITY_DEPTH} refund depth \
+                     + {SETTLE_MARGIN} margin); the node's \
                      hold window is too narrow for this locktime",
                     swap.locktime
                 ),
@@ -1585,11 +1596,11 @@ fn watchdog_resolve_swap_out(
             if !maker.is_htlc_spend_confirmed(&outpoint, &spk)? {
                 return Ok(());
             }
-            let ours_confirmed = match swap.refund_txid {
-                Some(txid) => maker.is_tx_confirmed(&txid)?,
-                None => false,
+            let refund_height = match swap.refund_txid {
+                Some(txid) => maker.tx_confirmation_height(&txid)?,
+                None => None,
             };
-            if !ours_confirmed {
+            let Some(refund_height) = refund_height else {
                 // Someone else won the outpoint, which can only be the
                 // taker's claim. Keep the swap and retry until we hold the
                 // confirmed spender and can take its preimage.
@@ -1598,8 +1609,20 @@ fn watchdog_resolve_swap_out(
                      retrying for the preimage"
                 );
                 return Ok(());
+            };
+            // One confirmation is not final: a reorg can replace the refund
+            // with the taker's claim, and this record holds the only key and
+            // the held payment that the claim's preimage would settle.
+            let tip = maker.get_current_height()?;
+            let depth = tip.saturating_sub(refund_height).saturating_add(1);
+            if depth < REFUND_FINALITY_DEPTH {
+                log::info!(
+                    "Swap-out {swap_id}: our refund has {depth}/{REFUND_FINALITY_DEPTH} \
+                     confirmations; keeping the swap"
+                );
+                return Ok(());
             }
-            log::info!("Swap-out {swap_id}: our refund confirmed; closing");
+            log::info!("Swap-out {swap_id}: our refund is {depth} deep; closing");
             let _ = ctx.ln.fail_held_payment(swap.payment_hash);
             maker.unwatch_outpoint(outpoint, spk);
             ctx.router.unsubscribe(&swap.payment_hash);

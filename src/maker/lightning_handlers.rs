@@ -1545,6 +1545,27 @@ pub fn watchdog_finish_swap_in_snapshot(
     watchdog_finish_swap_in(maker, &LnContext { ln, router }, swap_id, swap)
 }
 
+/// Shouts while a spent swap-out HTLC still has no preimage. The taker's claim
+/// window closes `locktime` blocks after our funding confirmed, and the held
+/// payment's claim deadline sits `SETTLE_MARGIN` blocks past that, so from
+/// `SETTLE_MARGIN` blocks before the window closes there is little lead time
+/// left to recover the preimage by hand.
+fn warn_if_preimage_overdue(maker: &Arc<MakerServer>, swap_id: &str, swap: &LnMakerSwap) {
+    let (Some(funded_at), Ok(tip)) = (swap.funding_height, maker.get_current_height()) else {
+        return;
+    };
+    let window_closes = funded_at.saturating_add(swap.locktime as u32);
+    if tip.saturating_add(SETTLE_MARGIN) >= window_closes {
+        log::error!(
+            "Swap-out {swap_id}: HTLC is spent but neither the watcher nor the chain              backend shows the spending transaction, so the preimage is unrecovered.              Tip {tip}, claim window closes near {window_closes}; the held payment will              fail back soon after unless the preimage is found"
+        );
+    } else {
+        log::warn!(
+            "Swap-out {swap_id}: HTLC is spent but the spending transaction is not visible yet"
+        );
+    }
+}
+
 fn watchdog_resolve_swap_out(
     maker: &Arc<MakerServer>,
     ctx: &LnContext,
@@ -1609,7 +1630,32 @@ fn watchdog_resolve_swap_out(
         }
         Ok(WatcherEvent::UtxoSpent {
             spending_tx: None, ..
-        }) => Ok(()), // spent but tx unknown yet; retry next tick
+        }) => {
+            // Spent, but the watcher has no spender: a Core watch stuck in
+            // reconciliation, or a notification it never saw. Waiting for it
+            // to catch up could outlast the held payment, so read the spender
+            // from the chain directly.
+            let spk = swap.htlc.script_pubkey().map_err(|e| {
+                log::warn!("lightning: htlc script build failed: {e}");
+                MakerError::General("htlc script build failed")
+            })?;
+            match maker.find_htlc_spend(&outpoint, &spk) {
+                Ok(Some(spend)) if swap.htlc.extract_preimage(&spend).is_some() => {
+                    log::info!(
+                        "Swap-out {swap_id}: watcher has no spender, but the chain shows                          {}; settling from it",
+                        spend.compute_txid()
+                    );
+                    return settle_swap_out_from_spend(maker, ctx, swap_id, swap, &spend);
+                }
+                // Not a claim (our own refund, say): the confirmed-spend
+                // branch handles that once the watcher reports it.
+                Ok(Some(_)) => {}
+                Ok(None) => {}
+                Err(e) => log::warn!("swap-out {swap_id}: spender lookup failed: {e:?}"),
+            }
+            warn_if_preimage_overdue(maker, swap_id, swap);
+            Ok(())
+        }
         Ok(WatcherEvent::NoOutpoint) => {
             // Not "unspent" — the watcher has no entry for this outpoint at
             // all, which happens when a startup rescan failed. Treating it

@@ -763,6 +763,18 @@ pub trait Maker: Send + Sync {
         Err(MakerError::General("lightning swaps not supported"))
     }
 
+    /// The transaction spending `outpoint`, mempool or confirmed, read
+    /// straight from the chain rather than from the watcher. `None` means the
+    /// chain backend knows of no spender.
+    #[cfg(feature = "lightning")]
+    fn find_htlc_spend(
+        &self,
+        _outpoint: &bitcoin::OutPoint,
+        _script: &bitcoin::ScriptBuf,
+    ) -> Result<Option<Transaction>, MakerError> {
+        Err(MakerError::General("lightning swaps not supported"))
+    }
+
     /// Whether `outpoint` is still unspent (mempool included), and how many
     /// blocks have passed since its transaction confirmed.
     ///

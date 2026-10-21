@@ -3743,6 +3743,19 @@ impl MakerTrait for MakerServer {
     }
 
     #[cfg(feature = "lightning")]
+    fn find_htlc_spend(
+        &self,
+        outpoint: &bitcoin::OutPoint,
+        script: &bitcoin::ScriptBuf,
+    ) -> Result<Option<Transaction>, MakerError> {
+        // Its own connection, so a slow lookup does not pin the wallet lock.
+        let chain = self.backend.connect().map_err(MakerError::Wallet)?;
+        chain
+            .spending_transaction(outpoint, script, None)
+            .map_err(MakerError::Wallet)
+    }
+
+    #[cfg(feature = "lightning")]
     fn htlc_unspent_and_age(
         &self,
         outpoint: &bitcoin::OutPoint,

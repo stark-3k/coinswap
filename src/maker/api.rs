@@ -1266,6 +1266,10 @@ impl MakerServer {
     pub(crate) fn wait_for_shutdown(&self, duration: Duration) -> bool {
         let mut remaining = duration;
         while !remaining.is_zero() {
+            // No serve loop yet during setup: a `maker-cli stop` drain is decided here.
+            if let Err(e) = self.stop_if_drained() {
+                log::error!("Drain check failed: {e:?}");
+            }
             if self.is_shutdown() {
                 return false;
             }
@@ -4581,6 +4585,17 @@ pub(crate) mod tests {
         assert!(maker.is_draining());
         maker.stop_if_drained().unwrap();
         assert!(maker.shutdown.load(Ordering::SeqCst));
+    }
+
+    /// Setup waits have no serve loop yet, so a drain must end them itself.
+    #[test]
+    fn drain_ends_a_setup_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), Vec::new());
+        assert!(maker.wait_for_shutdown(Duration::from_millis(10)));
+
+        maker.start_drain();
+        assert!(!maker.wait_for_shutdown(Duration::from_secs(30)));
     }
 
     /// A drain refuses a new swap id and lets a known one resume, as a taker

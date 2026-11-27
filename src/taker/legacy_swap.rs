@@ -139,7 +139,7 @@ impl Taker {
 
         // Ping every maker for the life of the march: while we negotiate one
         // hop, the others must not read our silence as a dropped swap.
-        let _heartbeat = self.start_route_heartbeat(&swap_id);
+        let mut _heartbeat = self.start_route_heartbeat(&swap_id);
 
         let mut prev_senders_info: Option<Vec<SenderContractTxInfo>> = None;
         // Taker's own keys for the last hop (set during last iteration)
@@ -572,6 +572,10 @@ impl Taker {
                                 spare_addr
                             );
                             self.substitute_and_negotiate_spare(maker_idx + 1, spare_addr)?;
+                            // The route changed: re-aim the heartbeat so the spare
+                            // is kept warm and the failed maker is dropped.
+                            drop(_heartbeat.take());
+                            _heartbeat = self.start_route_heartbeat(&swap_id);
                             // Restart current iteration: reconnect to maker[maker_idx],
                             // redo ProofOfFunding with the spare's keys for the next hop.
                             continue 'exchange;

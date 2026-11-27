@@ -369,6 +369,19 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
     };
     let listener = listener.filter(|_| maker_address.is_some());
 
+    // Spawn RPC server thread for maker-cli operations. Before the bond wait,
+    // which has no deadline: `maker-cli` must reach a maker that waits for funds.
+    let maker_rpc = Arc::clone(&maker);
+    let rpc_handle = thread::Builder::new()
+        .name("rpc-server".to_string())
+        .spawn(move || {
+            if let Err(e) = crate::maker::rpc::server::start_rpc_server(maker_rpc) {
+                log::error!("RPC server error: {:?}", e);
+            }
+        })
+        .map_err(MakerError::IO)?;
+    maker.thread_pool.add_thread(rpc_handle)?;
+
     // Only after recovery has started: the bond wait has no deadline, and
     // contracts left from a previous run must not wait on it.
     if let Some(maker_address) = maker_address.as_ref() {
@@ -405,18 +418,6 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
             maker.config.network_port
         );
     }
-
-    // Spawn RPC server thread for maker-cli operations
-    let maker_rpc = Arc::clone(&maker);
-    let rpc_handle = thread::Builder::new()
-        .name("rpc-server".to_string())
-        .spawn(move || {
-            if let Err(e) = crate::maker::rpc::server::start_rpc_server(maker_rpc) {
-                log::error!("RPC server error: {:?}", e);
-            }
-        })
-        .map_err(MakerError::IO)?;
-    maker.thread_pool.add_thread(rpc_handle)?;
 
     // Spawn idle state checker thread for recovery
     let maker_clone = Arc::clone(&maker);
